@@ -1,0 +1,340 @@
+---
+title: "Logistic Regression - First ED Visit Only"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# General Purpose of This Script
+
+* This script runs the logistic regression on the first recorded ED visit of each patient
+* This includes diagnostics, senstivity analyses, plots, and tables.
+* Comparable to Jones 2022 paper and ONS study.
+
+# Packages and Data
+
+```{r load_packages}
+library(librarian)
+shelf(
+  car, # for VIF
+  ResourceSelection, # for hosmer lemeshow
+  broom,
+  mice,
+  stringr,
+  kableExtra,
+  ggplot2,
+  data.table,
+  tidytable
+)
+
+data <- readRDS("./data/processed/data_mids_firstvisit.RDS")
+source("./programs/helper_scripts/plot_theme.R")
+source("./programs/helper_scripts/logit_or_pool_estim.R")
+```
+
+# Fit Model
+
+This fits the model on all imputed datasets.
+
+```{r}
+fit_logit <- with(
+  data,
+  glm(
+    death30_binary ~
+    Gender +
+    AgeonArrival +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    season_simple +
+    EDLOS_hours * AdmittedNonAdmitted +
+    ed_occupancy_at_arrival +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+```
+
+# Diagnostics
+
+* The diagnostics held across all 10 models that were fitted on the mids object.
+
+```{r}
+model_diag <- fit_logit$analyses[[1]]
+data_comp  <- mice::complete(data) |> as.data.table()
+```
+
+## Goodness of Fit
+
+```{r}
+hoslem.test(model_diag$y, fitted(model_diag))
+pROC::auc(pROC::roc(data_comp$death30_binary, fitted(model_diag)))
+```
+
+## Linearity of Log Odds
+
+* Visual test: scatter plot with LOESS smoother
+* Statistical test: Add 2nd degree polynomial and do LRT
+
+```{r}
+data_comp <- data_comp |>
+  mutate(
+    pred_prob = predict(model_diag, type = "response"),
+    log_odds = log(pred_prob / (1 - pred_prob))
+  )
+```
+
+```{r}
+data_comp |>
+  ggplot(aes(x = AgeonArrival, y = log_odds)) +
+  geom_point() + geom_smooth(method = "loess", se = FALSE)
+
+fit_diag_ag <- with(
+  data_comp,
+  glm(
+    death30_binary ~
+    Gender +
+    poly(AgeonArrival,2) +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    season_simple +
+    EDLOS_hours * AdmittedNonAdmitted +
+    ed_occupancy_at_arrival +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+
+anova(model_diag, fit_diag_ag, "lrt")
+```
+
+```{r}
+data_comp |>
+  ggplot(aes(x = ed_occupancy_at_arrival, y = log_odds)) +
+  geom_point() + geom_smooth(method = "loess", se = FALSE)
+
+fit_diag_edoc <- with(
+  data_comp,
+  glm(
+    death30_binary ~
+    Gender +
+    AgeonArrival +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    season_simple +
+    EDLOS_hours * AdmittedNonAdmitted +
+    poly(ed_occupancy_at_arrival,2) +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+
+anova(model_diag, fit_diag_edoc, "lrt")
+```
+
+```{r}
+data_comp |>
+  ggplot(aes(x = EDLOS_hours, y = log_odds)) +
+  geom_point() + geom_smooth(method = "loess", se = FALSE) +
+  facet_wrap(~ AdmittedNonAdmitted) # bc of interaction
+
+fit_diag_edlos <- with(
+  data_comp,
+  glm(
+    death30_binary ~
+    Gender +
+    AgeonArrival +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    season_simple +
+    poly(EDLOS_hours,2) * AdmittedNonAdmitted +
+    ed_occupancy_at_arrival +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+
+anova(model_diag, fit_diag_edoc, "lrt")
+```
+
+## Multi-Collinearity
+* `EDLOS` shows collinearity with the interaction term `EDLOS_hours * AdmittedNonAdmitted`.
+* This is to be expected:
+  + https://stats.stackexchange.com/questions/606803/multicollinearity-and-interaction-effects
+  + https://www.statalist.org/forums/forum/general-stata-discussion/general/1359532-is-multicollinearity-between-interaction-terms-a-problem
+
+```{r}
+car::vif(model_diag)
+```
+
+# Results
+
+## Table 
+
+```{r}
+fit_logit_tidy <- fc_tidy_estim(fit_logit)
+
+fc_estim_latex_tab <- function(esimate_df) {
+  
+  tex_ready <- esimate_df |> 
+    mutate(
+      across(where(is.numeric), round, 3),
+      ci.95.comb = paste0("(", or.ci95.low, "-", or.ci95.upper, ")"),
+      `Log-Odds (Std.Error)` = paste0(estimate, " (", std.error, ")"),
+      signif = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      p.value = as.character(p.value),
+      p.value = fifelse(p.value == "0", "<0.001", p.value),
+      `P-Value` = paste0(p.value, signif),
+      `Odds Ratio (95%CI)` = paste(odds.ratio, ci.95.comb)
+    ) |>
+    select(term, `Log-Odds (Std.Error)`, `Odds Ratio (95%CI)`, `P-Value`) |>
+    kable(
+      digits = 3,
+      format = "latex",
+      booktabs = TRUE,
+      align = c("l","l","l","l","l")
+    )
+  
+  return(tex_ready)
+}
+
+fc_estim_latex_tab(fit_logit_tidy) |>
+  writeLines(
+  "./output/tables/logistic_simple/logit_estim.tex"
+  )
+
+fit_logit_tidy |> kable(digits = 3)
+```
+
+## Plot
+
+The point estimates and their 95% CI are visualised as a dot-whisker plot.
+
+```{r}
+fit_logit_tidy_plot <- fit_logit_tidy |>
+  filter(term != "(Intercept)")
+
+shading <- fit_logit_tidy_plot |>
+  mutate(ypos = row_number()) |>
+  filter(ypos %% 2 == 0) |>
+  mutate(
+    ymin = ypos - 0.5,
+    ymax = ypos + 0.5
+  )
+
+plot_dotwhisker <- ggplot(fit_logit_tidy_plot, aes(x = odds.ratio, y = term)) +
+  geom_rect(
+    data = shading,
+    aes(ymin = ypos - 0.5, ymax = ypos + 0.5),
+    xmin = -Inf, xmax = log10(16),
+    fill = "gray70", alpha = 0.3,
+    inherit.aes = FALSE
+  ) +
+  geom_vline(xintercept = 1, linetype = "dotted", color = "gray50") +
+  geom_errorbarh(aes(xmin = or.ci95.low, xmax = or.ci95.upper), height = 0.2) +
+  geom_point(size = 1.5) +
+  scale_x_log10(
+    breaks = c(0.5, 1, 2, 4, 8, 16),
+    limits = c(0.5, 16),
+    labels = function(x) ifelse(x %% 1 == 0, as.character(x), as.character(x))
+  ) +
+  labs(
+    x = "Hazard ratio: death within 30 days",
+    y = "Covariate"
+  ) +
+  basic_theme
+
+plot_dotwhisker
+```
+
+# Sensitivity Analysis
+* Using the 4hr breach fraction at the time of arrival.
+* i.e. How many patients of the ones that are currently in the ED are already for longer than 4 hrs there, at the time of arrival of the new patient.
+
+```{r}
+fit_logit <- with(
+  data,
+  glm(
+    death30_binary ~
+    Gender +
+    AgeonArrival +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    season_simple +
+    EDLOS_hours * AdmittedNonAdmitted +
+    breach_4hr_frac +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+
+fit_logit_pooled <- mice::pool(fit_logit)
+```
+
+```{r}
+fit_logit_tidy <- fc_tidy_estim(fit_logit)
+fit_logit_tidy |> kable(digits = 3)
+```
