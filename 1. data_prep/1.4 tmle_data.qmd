@@ -1,0 +1,87 @@
+---
+title: "Define Crowding Treatment Groups"
+author: "USN 3775"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+options(scipen = 999)
+
+library(librarian)
+shelf(
+  data.table,
+  tidytable,
+  quiet = TRUE
+)
+```
+
+# Treatment Assignment
+
+* In a hypothetical randomised controlled trial, patients are either allocated to a crowded or non-crowded ED.
+* A crowded ED is defined as the Addenbrooke's ED at the top 20% of observed occupancy (80th or higher percentile of occupancy)
+* A non-crowded ED is defined as the Addenbrooke's ED at the bottom 50% of observed occupancy (50th or lower percentile of occupancy)
+* The remaining participants are used for sensitivity analyses.
+* The crowding percentiles are re-calculated before assigning the treatment. They were calculates first in the pre-processing script. But there, the data included repeat ED visits. They are re-calculated here to reflect the distribution across patients' first visit.
+* An alternative crowding definition is calculated as well, where only the top 10% are considered crowded.
+
+```{r}
+data <- readRDS("./data/processed/data_mids_firstvisit.RDS") |>
+  mice::complete() |>
+  as.data.table() |>
+  select(-crowding_percentile) |>
+  mutate(
+    crowding_percentile = dplyr::ntile(ed_occupancy_at_arrival, 100),
+    crowding_treatment = case_when(
+      crowding_percentile >= 81 ~ "crowded",
+      crowding_percentile <= 50 ~ "not_crowded",
+      TRUE ~ "sensitivity"
+    ),
+    crowding_treatment_sens = case_when(
+      crowding_percentile >= 91 ~ "crowded",
+      crowding_percentile <= 60 ~ "not_crowded",
+      TRUE ~ "sensitivity"
+    ),
+    crowding_treatment = as.factor(crowding_treatment),
+    crowding_treatment_sens = as.factor(crowding_treatment_sens)
+  )
+```
+
+# Transformation of Hours of Day
+
+* First-order harmonic transformation of the hour-of-day to model it as cycle with length of 24 hours.
+* A second order harmonic transformation resulted in higher AIC/BIC values when used in a logistic regression model with the binary outcome of crowding and was not used in subsequent analyses.
+
+```{r}
+data <- data |>
+  mutate(
+    arrival_hourmin = hour(ArrivalDateTime) + minute(ArrivalDateTime) / 60,
+    hour_sin = sin(2 * pi * arrival_hourmin / 24),
+    hour_cos = cos(2 * pi * arrival_hourmin / 24)
+  )
+```
+
+# Data Export
+
+```{r}
+saveRDS(
+  data,
+  file = "./data/processed/data_tmle.RDS"
+)
+```

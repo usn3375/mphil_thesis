@@ -1,0 +1,403 @@
+---
+title: "Data Cleaning"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# Packages and Data
+```{r load_packages}
+library(librarian)
+
+shelf(
+  haven,
+  stringr,
+  data.table,
+  tidytable
+)
+
+data_raw <- read_dta("./data/raw/250130_data.dta") |>
+  as.data.table()
+```
+
+```{r echo = FALSE}
+data_raw <- data_raw |> 
+  select(id, everything())
+```
+
+# General Data Cleaning
+
+## Select Relevant Columns
+
+* After consultation with an ED physician (on `2025-02-12`), several variables were identified, which can be deleted from this dataset before further processing.
+* They were either not of relevance to the research question or unreliably recorded.
+
+```{r select_cols}
+data <- data_raw |>
+    select(
+    -c(
+      DepartureType,
+      Group,
+      RapidAccessTreatment,
+      OldDepartureDateTime,
+      ReferralTime,
+      ArrivaltoReferral,
+      SeniorReviewBegin,
+      SeniorReviewComplete,
+      ArrivaltoSeniorReviewComplet,
+      BedRequested,
+      ReadytoLeave,
+      ReadytoleavetoDeparture,
+      PlacedinCubicle,
+      EAU3EAU4N2,
+      "_merge",
+      FiestSDEC,
+      InitialSpecialty,
+      SecondaryNursingAssessment,
+      EPTDeathDate,
+      IPSpec,
+      Deathwithin30daysofanIPad,
+      Deathwithin7daysofanOPatt,
+      DeathinanElectiveAdmission,
+      Locationattimeofdischarge,
+      TotalProcedures,
+      TotalInvestigations,
+      DecisiontoAdmit,
+      AgeYearsAtTimeofDeath
+    )
+  )
+```
+
+## Set Empty Cells to NA
+All completely empty cells in the dataset are set to `NA`. 
+```{r set_na}
+data <- data %>%
+  mutate(across(where(is.character), ~na_if(., "")))
+```
+
+## Adjust Numeric Variable Type
+* Some cols are set to numeric for correct further processing.
+* The column `AgeonArrival` was not set to numeric here, because it needed some prior cleaning (see in one of the sections below).
+
+```{r set_cols_numeric}
+data <- data |>
+  mutate(
+    AcuityScore = as.numeric(AcuityScore),
+    CareHomeBinary = as.integer(CareHomeBinary)
+  )
+```
+
+## Change Characters to Factors
+
+```{r factorise}
+data <- data |>
+  mutate(across(where(is.character), as.factor))
+```
+
+## Delete Duplicate Entries
+
+* 2 participants have duplicate entries, where multiple of their "visits" have exactly the same arrival date and time (to the second).
+* Their second "visit" is deleted.
+
+```{r del_duplicates}
+data <- data |>
+  distinct(id, ArrivalDateTime, .keep_all = TRUE)
+```
+
+# Cleaning by Column
+
+## Participant ID
+
+* Some observations don't have a unique ID. These are mostly foreign patients without an NHS number.
+* They are deleted from the dataset.
+
+```{r clean_ID}
+data <- data |>
+  filter(!is.na(id)) |> 
+  mutate(id = as.factor(id))
+```
+
+## Age on Arrival
+* The age on arrival in the ED column includes "Months" for children under 1 year of age. These are replaced by a numerical age in years and then the variable type is set to numeric.
+* Using the numeric column, we can filter out patients who are younger than 16 at the time of attendance. 
+* This makes sense, as they don't receive a NEWS score, and they are admitted to the children's hospital, not the general ward.
+* Furthermore, their treatment pathway and mortality patterns differ significantly. It makes sense to exclude them.
+
+```{r clean_age}
+data <- data |>
+  mutate(
+    AgeonArrival = case_when(
+      str_detect(AgeonArrival, "Months") ~ "0.5",
+      TRUE ~ AgeonArrival),
+    AgeonArrival = as.numeric(AgeonArrival)
+  ) |>
+  filter(AgeonArrival >= 16)
+```
+
+## Gender
+
+* There are too few cases to have stable regression estimates for Genders other than male or female.
+* There are 36 people with other Gender (`N` or `U`). It was tried to pool all of them into an `other` category to improve estimates. But that did not improve help.
+
+```{r filter_gender}
+data <- data |>
+  filter(Gender %in% c("M", "F"))
+```
+
+## Planned Return
+
+The planned returns are removed from the dataset, as these are mostly patients who returned to the ER to get stitches removed or receive wound care.
+
+```{r planned_return}
+data <- data |>
+  filter(VisitTypePlannedReturn != "Planned return")
+```
+
+## Arrival Mode
+
+* Patients who arrive by ambulance usually have more acute illness.
+* Here we change the arrival mode variable to be either `ambulance` or `non_amublance`.
+* This simplifies the different transport mode values and ambulance types. 
+
+```{r clean_arrival_mode}
+data <- data |>
+  mutate(
+    ArrivalMode = case_when(
+      str_detect(ArrivalMode, "Ambulance") ~ "ambulance",
+      str_detect(ArrivalMode, "Foot")      ~ "non_ambulance",
+      str_detect(ArrivalMode, "Police")    ~ "non_ambulance",
+      str_detect(ArrivalMode, "Transport") ~ "non_ambulance",
+      str_detect(ArrivalMode, "Taxi")      ~ "non_ambulance",
+      )
+    )
+```
+
+## Covid Cohort
+
+* Turned it into a binary variable (`isolation` vs `no_isolation`)
+* `SR - Side room required for other reason` is assumed to be not isolated
+* `Non-Covid` is assumed to require the isolation room for a suspected infection other than Covid.
+
+```{r clean_covid_isol}
+data <- data |>
+  mutate(
+    CovidCohort = case_when(
+      str_detect(CovidCohort, "required for other") ~ "no_isolation",
+      str_detect(CovidCohort, "No isolation")       ~ "no_isolation",
+      str_detect(CovidCohort, "COVID-19 confirmed") ~ "isolation",
+      str_detect(CovidCohort, "COVID-19 possible")  ~ "isolation",
+      str_detect(CovidCohort, "Non-Covid")          ~ "isolation",
+      str_detect(CovidCohort, "Group")              ~ "isolation",
+      TRUE ~ CovidCohort
+    )
+  )
+```
+
+## ED Area
+
+Reduce the variable to a binary, either they were moved to the resuscitation room or they were not in the resuscitation room.
+
+```{r clean_area}
+data <- data |>
+  mutate(
+    Area = case_when(
+      str_detect(Area, "majors") ~ "non_resus",
+      str_detect(Area, "paeds")  ~ "non_resus",
+      str_detect(Area, "minors") ~ "non_resus",
+      str_detect(Area, "SDEC")   ~ "non_resus",
+      TRUE ~ Area
+    )
+  )
+```
+
+
+## Acuity Score
+
+* The recording system for the Acuity Score changed throughout the observation period.
+* By bundling them into 3 ranges, the distribution of the score fluctuates less over time.
+* Some very severe cases (~1k) were transferred to the resuscitation area immediately, without recording an Acuity Score. Those cases receive an acuity score of `1-2`.
+
+```{r clean_acuity}
+data <- data |>
+  mutate(
+    AcuityScore = as.character(AcuityScore),
+    AcuityScore = case_when(
+      AcuityScore %in% c("1", "2") ~ "1-2",
+      AcuityScore %in% c("3", "4") ~ "3-4",
+      is.na(AcuityScore) & str_starts(Area, "resus") ~ "1-2",
+      TRUE ~ AcuityScore
+    ),
+    AcuityScore = factor(
+      AcuityScore,
+      levels = c("5", "3-4", "1-2")
+    )
+  )
+```
+
+
+## NEWS Score
+* Patient who are doing very well don't necessarily receive a NEWS score.
+* The ED physician said that they are healthier than NEWS score of `0` patients and suggested to score them as `-1`.
+* It was checked using undadjusted logistic regression with death within 30 days as an outcome whether this holds - and it does.
+
+```{r clean_news}
+data <- data |>
+  mutate(
+    FirstNEWS = case_when(
+      str_detect(FirstNEWS, "NoScore") ~ "-1",
+      TRUE ~ FirstNEWS),
+    FirstNEWS = as.numeric(FirstNEWS)
+  )
+```
+
+## Referal Mode
+
+* This variable refers to how patients were referred to the ED.
+* It was discussed (`2025-02-12`) that it makes sense to reduce the variable options to a binary `clinical` vs `non-clinical`. The reason being that GP- and physician referrals are usually sicker than non-GP referrals.
+
+```{r referral_source}
+data <- data |>
+  mutate(
+    ReferralSource = case_when(
+      str_detect(ReferralSource, "Outpatient clinic")  ~ "clinical",
+      str_detect(ReferralSource, "Private specialist") ~ "clinical",
+      str_detect(ReferralSource, "Ambulance")   ~ "non_clinical",
+      str_detect(ReferralSource, "111")         ~ "non_clinical",
+      str_detect(ReferralSource, "GP")          ~ "clinical",
+      str_detect(ReferralSource, "Self-referral") ~ "non_clinical",
+      str_detect(ReferralSource, "Emergency department") ~ "clinical",
+      str_detect(ReferralSource, "Urgent care") ~ "clinical",
+      str_detect(ReferralSource, "Advanced care") ~ "non_clinical",
+      str_detect(ReferralSource, "Community nurse") ~ "non_clinical",
+      str_detect(ReferralSource, "Hospital inpatient ward") ~ "clinical",
+      str_detect(ReferralSource, "Pharmacist") ~ "non_clinical",
+      str_detect(ReferralSource, "Optician / optometrist") ~ "non_clinical",
+      str_detect(ReferralSource, "Police") ~ "non_clinical",
+      str_detect(ReferralSource, "Social services") ~ "non_clinical",
+      str_detect(ReferralSource, "Dentist") ~ "non_clinical",
+      str_detect(ReferralSource, "Detention centre") ~ "non_clinical",
+      str_detect(ReferralSource, "Carer") ~ "non_clinical",
+      str_detect(ReferralSource, "Midwife") ~ "non_clinical",
+      str_detect(ReferralSource, "Mental health assessment") ~ "non_clinical",
+      str_detect(ReferralSource, "Non NHS telephone") ~ "non_clinical",
+      str_detect(ReferralSource, "Community mental health") ~ "non_clinical",
+      str_detect(ReferralSource, "School nurse") ~ "non_clinical",
+      str_detect(ReferralSource, "Health visitor") ~ "non_clinical",
+      str_detect(ReferralSource, "Older persons day") ~ "non_clinical",
+      str_detect(ReferralSource, "Homeless persons") ~ "non_clinical",
+      str_detect(ReferralSource, "Mountain rescue") ~ "clinical",
+      str_detect(ReferralSource, "Prison") ~ "non_clinical",
+      str_detect(ReferralSource, "Fire service") ~ "non_clinical"
+      )
+    )
+```
+
+```{r, echo = FALSE}
+rm(data_raw, numcols)
+```
+
+## Admitted vs Discharged
+
+* There are two columns which indicate admission or discharge of the patients, `AdmittedNonAdmitted` and `DisposalDescription`.
+* They are congruent, but `DisposalDescription` captures more information. 
+* A few values of the `AdmittedNonAdmitted` column are corrected using information from `DisposalDescription`.
+
+```{r admission}
+data <- data |>
+  mutate(
+    AdmittedNonAdmitted = tolower(AdmittedNonAdmitted),
+    AdmittedNonAdmitted = str_replace(AdmittedNonAdmitted, "-", "_"),
+    AdmittedNonAdmitted = case_when(
+      EDDeath == "Y" ~ "non_admitted",
+      str_detect(DisposalDescription, "died in department") ~ "non_admitted",
+      str_detect(DisposalDescription, "another centre")     ~ "admitted",
+      !is.na(AdmissionLoS) ~ "admitted",
+      TRUE ~ AdmittedNonAdmitted
+    )
+  )
+```
+
+## Admitting Specialty
+
+* Classifying into ICU and ward admission.
+* Included also non-admitted as a level in this variable to have a single variable for both admission and ICU visit for modelling later.
+* 8 patients were classified as non-admitted in the `AdmittedNonAdmitted` variable, but they still have an ICU visit and a discharging specialty recorded. Their admission status is corrected.
+* A binary indicator for an ICU visit is created as well.
+
+```{r admitting_specialty}
+data <- data |>
+  mutate(
+    AdmittingWard = case_when(
+      str_detect(AdmittingWard, "NCCU") ~ "admit_icu",
+      str_detect(AdmittingWard, "ICU")  ~ "admit_icu",
+      str_detect(AdmittingWard, "ITU")  ~ "admit_icu",
+      AdmittedNonAdmitted == "non_admitted" ~ "non_admitted",
+      TRUE ~ "admit_ward"
+    ),
+    AdmittedNonAdmitted = fifelse(
+      AdmittingWard == "admit_icu",
+      "admitted", AdmittedNonAdmitted
+    ),
+    icu_admission = fifelse(
+      AdmittingWard == "admit_icu",
+      1L, 0L
+    )
+  )
+```
+
+* Then, the discharge specialty is cleaned, and simplified into a binary, `medicine` vs `non_medicine`.
+* `NA` are assumed to be `non_medicine`.
+
+```{r discharge_specialty}
+data <- data |>
+  mutate(
+    LastSpecialty = tolower(LastSpecialty),
+    LastSpecialty = case_when(
+      str_detect(AdmittedNonAdmitted, "non_admitted") ~ "non_admitted",
+      str_detect(LastSpecialty, "respiratory")  ~ "medicine",
+      str_detect(LastSpecialty, "rheumatology") ~ "medicine",
+      str_detect(LastSpecialty, "cardiology")   ~ "medicine",
+      str_detect(LastSpecialty, "haematology")  ~ "medicine",
+      str_detect(LastSpecialty, "infectious")   ~ "medicine",
+      str_detect(LastSpecialty, "oncology")     ~ "medicine",
+      str_detect(LastSpecialty, "gastroent")    ~ "medicine",
+      TRUE ~ "non_medicine"
+    )
+  )
+```
+
+## Exclude Patients that Are Dead on Arrival
+
+Reason: They shouldn't contribute to ED deaths in the model, as waiting times and crowding didn't affect them.
+
+```{r}
+data <- data |>
+  filter(!str_detect(VisitTypePlannedReturn, "Dead on Arrival"))
+```
+
+# Export File
+```{r export_file}
+saveRDS(
+  data,
+  file = "./data/processed/data_preprocessed.RDS"
+)
+```

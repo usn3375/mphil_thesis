@@ -1,0 +1,437 @@
+---
+title: "Data Pre-Processing"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# General Purpose of This Script
+
+* This script pre-calculates variables that are used in subsequent data analysis.
+* Multiple imputations are run in another script, as my computer ran into memory problems otherwise.
+
+# Packages and Data
+
+```{r load_packages}
+library(librarian)
+shelf(
+  haven,
+  stringr,
+  forcats,
+  slider,
+  lubridate,
+  data.table,
+  tidytable
+)
+
+data <- readRDS("./data/processed/data_preprocessed.RDS") |>
+  as.data.table()
+```
+
+# Attendance Reason
+* 206 different attendance reasons
+* Using published literature from Addenbrooke's ED department (DOI: `10.7759/cureus.56083`), the presentation reasons are classified into low and high risk of 30-day mortality. 
+* After using tables 2, 3, and 4 to classify all attendance reasons into granular mortality groups (veryhigh-high-medium-low), it turned out that the study results don't generalise very well to this dataset. Possibly because they only look at in-patient mortality. 
+* The study reliably identified 4 attendance reasons with the highest mortality. These are classified into a `high` mortality group, all other attendance reason are classified as `low` mortality. 
+
+```{r att_reason_mortality}
+data <- data |>
+   mutate(AttendanceReason = tolower(AttendanceReason)) |>
+   mutate(
+     att_reason_mortality = case_when(
+       str_detect(AttendanceReason, "cardiac arrest") ~ "high",
+       str_detect(AttendanceReason, "respiratory arrest") ~ "high",
+       str_detect(AttendanceReason, "drowsy") ~ "high",
+       str_detect(AttendanceReason, "hypothermia") ~ "high",
+       #
+       TRUE ~ "low"
+     )
+   )
+```
+
+# Death
+
+* To determine the deaths within 30d/7d of presentation to the ED, I looked at which death dates are within 30d/7d.
+* There may be negative numbers up to `-1` day in `diff_days_arrival_death`. These occur if the death occured on the same day as the presentation to the ED. As ArrivalDateTime includes hours and minutes, and DateofDeath only contains the date, when subtracting them, slight negative numbers may occur.
+* Whenever a value is `<0`, it is set to `0`. It was manually checked that all of these deaths indeed happened on the day of the ED visit.
+
+```{r death}
+data <- data |>
+  mutate(
+    diff_days_arrival_death = as.numeric(difftime(DateofDeath, ArrivalDateTime, units = "days")),
+    diff_days_arrival_death = fifelse(diff_days_arrival_death < 0, 0, diff_days_arrival_death),
+    death_binary = fifelse(is.na(DateofDeath), 0L, 1L),
+    death30_binary = case_when(
+      diff_days_arrival_death <= 30 ~ 1L,
+      diff_days_arrival_death > 30 | is.na(DateofDeath) ~ 0L
+    ),
+    death20_binary = case_when(
+      diff_days_arrival_death <= 20 ~ 1L,
+      diff_days_arrival_death > 20 | is.na(DateofDeath) ~ 0L  
+    ),
+    death40_binary = case_when(
+      diff_days_arrival_death <= 40 ~ 1L,
+      diff_days_arrival_death > 40 | is.na(DateofDeath) ~ 0L  
+    )
+  )
+```
+
+# Multiple Attendances
+
+* The variable `attendance_count` indicates the number of ED visits that the patient had up to the current visit.
+* The variable `attendance_total` indicates the total number of visits to the ED over the entire study period.
+* 6 Participants with more than 100 visits to the ED each were deleted from the dataset, as they came to the ED for social/administrative reasons.
+* An `attendance_count_cat` is created, as the majority of visits are first and second visits.
+
+```{r re_attendance}
+data <- data |>
+  arrange(ArrivalDateTime) |>
+  group_by(id) |>
+  mutate(
+    att30_no = slide_index_dbl(
+      ArrivalDateTime,
+      ArrivalDateTime,
+      ~ length(.x),
+      .before = days(30)  
+    ),
+    att30_no = as.integer(att30_no),
+    attendance_count = row_number(),
+    attendance_total = n()
+  ) |>
+  ungroup() |>
+  filter(attendance_total < 100) |>
+  mutate(
+    attendance_count_cat = case_when(
+      attendance_count == 1L ~ "1",
+      attendance_count == 2L ~ "2",
+      attendance_count >= 3L ~ "3_or_more"
+    )
+  )
+```
+
+# Time Data
+
+## Arrival Time of Day
+
+* Here I categorise the arrival time into day (`8:00` - `17:59`) and night (`18:00` to `7:59`).
+* This coincides approximately with the shift changes and fluctuations in staffing levels.
+
+```{r arrival_time}
+data <- data |>
+  mutate(
+    arrival_hour = hour(ArrivalDateTime),
+    arrival_hourmin = hour(ArrivalDateTime) + minute(ArrivalDateTime) / 60,
+    arrival_time_category = ifelse(
+      arrival_hour >= 8 & arrival_hour < 18, 
+      "day", "night"
+    )
+  )
+```
+
+## Weekday of Arrival
+
+* Categorisation of arrival into `weekdays` vs `weekend.`
+* This introduces fewer variable levels and less noise than using every individual day of the week.
+
+```{r weekday}
+data <- data |>
+  mutate(
+    arrival_weekday = weekdays(ArrivalDateTime),
+    arrival_weekday = tolower(arrival_weekday),
+    arrival_weekday_cat = ifelse(
+      arrival_weekday %in% c("saturday", "sunday"), 
+      "weekend", "weekday"),
+    arrival_weekday = factor(
+      arrival_weekday,
+      levels = c(
+          "monday",
+          "tuesday",
+          "wednesday",
+          "thursday",
+          "friday",
+          "saturday",
+          "sunday"
+      )
+    )
+  )
+```
+
+## Season of Arrival
+
+* I add two season variables. 
+* A 4-part specific one and a simplified one, where only `winter` and `non_winter` are specified. 
+The rationale behind the simple variable is that the `non_winter` seasons don't differ as much in their patient presentations.
+
+```{r ED_season}
+data <- data |>
+  mutate(
+    season = case_when(
+      month(ArrivalDateTime) %in% 3:5  ~ "spring",
+      month(ArrivalDateTime) %in% 6:8  ~ "summer",
+      month(ArrivalDateTime) %in% 9:11 ~ "autumn",
+      TRUE ~ "winter"
+      ),
+    season_simple = case_when(
+      month(ArrivalDateTime) %in% 3:11  ~ "non_winter",
+      TRUE ~ "winter"
+    )
+  )
+```
+
+## ED Length of Stay
+
+* There are a few entries with less than 0 hours EDLOS (15 entries) and more than 150 hours (1 entry).
+* They are assumed to be data entry errors and they are removed.
+
+```{r EDLOS}
+data <- data |>
+  mutate(
+    EDLOS_hours = as.numeric(
+      difftime(
+        DepartureDateTime,
+        ArrivalDateTime,
+        units = "hours"
+      )
+    )
+  ) |>
+  filter(EDLOS_hours > 0 & EDLOS_hours < 150)
+```
+
+* To make sure that this EDLOS calculation matches the pre-calculated EDLOS, we search the dataset for entries where the difference is greater than 1 minute. 
+* There are no such entries.
+
+```{r edlos_accuracy}
+edlos_accuracy <- data |>
+  select(EDLOS_hours, MinsinDept) |>
+  mutate(MinsinDept = MinsinDept/60) |>
+  mutate(edlos_diff = EDLOS_hours - MinsinDept) |>
+  filter(edlos_diff > (1/60))
+```
+
+# ED Crowding
+
+## ED Occupancy at Arrival and Breach Rate
+
+* Compute the number of people in the ED when a new patient arrives.
+* A sweep-line algorithm was written to compute the number of overlapping intervals. This algorithm has relatively low time-complexity and runs fast.
+* As we're already counting the number of patients present in the ED, it's simple to also calculate the number of currently waiting patients that have waited longer than 4 hrs.
+* This metric (4hr breach rate) is used by Jones et al. (doi: 10.1136/emermed-2021-211572).
+
+```{r crowding_metric}
+events <- rbind(
+  data[, .(event_time = ArrivalDateTime,   type = "arrival",   pid = .I)],
+  data[, .(event_time = DepartureDateTime, type = "departure", pid = .I)]
+)
+
+setorder(events, event_time, type)
+
+# pre-allocate vectors
+active_count  <- 0L
+ed_census     <- integer(nrow(data))
+long_stays    <- integer(nrow(data))
+active_dt     <- data.table(
+  pid = integer(), 
+  arrival_time = as.POSIXct(character())
+)
+
+# "sweep" through the ordered list of events
+for (i in seq_len(nrow(events))) {
+  ev <- events[i]
+  
+  if (ev$type == "departure") {
+    # if a patient leaves: -1 to the active patient count
+    active_dt <- active_dt[pid != ev$pid]
+    active_count <- active_count - 1L
+    
+  } else {
+    # record total occupancy
+    ed_census[ev$pid] <- active_count
+    
+    # count how many have been in ED longer than 4h at the time of arrival
+    # of a new patients
+    cutoff <- ev$event_time - hours(4)
+    long_stays[ev$pid] <- nrow(active_dt[arrival_time <= cutoff])
+    
+    # add +1 to the active patient count for the arriving patient
+    active_dt <- rbind(active_dt, data.table(pid = ev$pid, arrival_time = ev$event_time))
+    active_count <- active_count + 1L
+  }
+}
+
+data <- data |> 
+  mutate(
+    ed_occupancy_at_arrival = ed_census,
+    breach_4hr_count = long_stays,
+    breach_4hr_frac  = long_stays/ed_census
+  ) |> 
+  arrange(ArrivalDateTime)
+```
+
+## Truncate Dataset
+
+* The calculations of the crowding metrics works by counting relevant rows around an attendance (i.e. other patients who attended) in the dataset. 
+* The first 48 hours were discarded as a "burn-in" for the crowding metric.
+
+```{r truncate_data}
+data <- data |> 
+  filter(
+    ArrivalDateTime > min(ArrivalDateTime) + hours(48)
+  )
+```
+
+## Calculate Crowding Percentiles
+
+* The percentiles of crowding are calculated, from `1` (very crowded) to `0` (not crowded).
+* ED occupancy at arrival is used as a crowding metric.
+* Has to be calculated after truncation, because the burn-in samples will have lower-than-actual ED occupancy.
+
+```{r crowd_percentiles}
+data <- data |>
+  mutate(
+    crowding_percentile = percent_rank(ed_occupancy_at_arrival)
+  )
+```
+
+# Prepare Variables for Survival Analysis
+
+* The survival analysis needs a `start` and `stop` variable.
+* The `start` time is set to whent the individual enters the ED.
+* The `stop` time is set to when the individual re-visits the ED `OR` dies `OR` the censoring date.
+* Death is recorded as the calendar date, whereas arrival time is recorded in hours. If death occurs on the same day as entry to the ED, this can sometimes lead to death happening shortly "before" arrival. In these cases, to calculate the time of death, an hour is added to the arrival time.
+* In 4 cases, the next visit was recorded at the same time as then preceding visit. These cases are deleted from the dataset.
+* This code block doesn't left truncate overlapping intervals and does not limit the follow-up to 30 days. This is done in the next section.
+
+```{r survival_data}
+study_start_date <- min(data$ArrivalDateTime)
+study_end_date   <- as.Date("2025-01-30")
+
+data <- data |>
+  mutate(
+    start_time = as.numeric(difftime(ArrivalDateTime,    study_start_date, units = "days")),
+    time_to_censor = as.numeric(difftime(study_end_date, study_start_date, units = "days")),
+    time_to_death_raw = as.numeric(difftime(DateofDeath, study_start_date, units = "days"))
+  ) |>
+  arrange(id, ArrivalDateTime) |>
+  group_by(id) |>
+  mutate(
+    date_next_visit = lead(ArrivalDateTime),
+    time_next_visit = as.numeric(difftime(date_next_visit, study_start_date, units = "days")),
+    time_to_death = case_when(
+      !is.na(time_to_death_raw) & time_to_death_raw <= start_time ~ start_time + 0.04,
+      !is.na(time_to_death_raw) & time_to_death_raw <= time_next_visit ~ time_next_visit + 0.04,
+      is.na(time_to_death_raw) ~ NA,
+      TRUE ~ time_to_death_raw
+    ),
+    stop_time = pmin(time_next_visit, time_to_death, time_to_censor, na.rm = TRUE),
+    next_event_death = fifelse(
+      !is.na(time_to_death) & stop_time == time_to_death,
+      1L,0L
+    )
+  ) |>
+  filter(start_time != stop_time) |>
+  ungroup() |> 
+  select(
+    -time_to_death_raw, 
+    -time_to_censor, 
+    -time_next_visit, 
+    -date_next_visit
+    )
+```
+
+## Left Truncation - 30 day follow-up
+
+* Risk intervals are left truncated if they overlap with prior 30-day risk intervals
+* Two code blocks: the first one sets the stop time and the event indicator. The second one needs the grouping to define the start time and left truncate them, to avoid overlapping intervals.
+
+```{r left_trunc}
+data <- data |>
+  arrange(id, ArrivalDateTime) |>
+  mutate(
+    stop_time_30_lt = case_when(
+      death30_binary == 0 ~ start_time + 30,
+      death30_binary == 1 ~ time_to_death
+    ),
+    next_event_death_30_lt = death30_binary
+  )
+
+data <- data |>
+  group_by(id) |>
+  slice_head(
+    # removes ED visits between prior ED visit and death within 30d
+    n = if (any(death30_binary == 1)) {
+      min(which(death30_binary == 1))
+    } else {
+      n() 
+    }
+  ) |>
+  mutate(
+    prev_interval_end = lag(cummax(stop_time_30_lt), default = 0)
+  ) |>
+  ungroup() |>
+  mutate(
+    start_time_30_lt = pmax(start_time, prev_interval_end)
+  ) |>
+  select(-prev_interval_end)
+```
+
+# Set Factor Levels and Drop Un-Used Levels
+
+```{r factor_levels}
+factors_ref_levels <- c(
+  AdmittedNonAdmitted = "non_admitted",
+  AdmittingWard = "non_admitted",
+  VisitTypePlannedReturn = "No",
+  ArrivalMode = "non_ambulance",
+  CovidCohort = "no_isolation",
+  Area = "non_resus",
+  ReferralSource = "non_clinical",
+  att_reason_mortality = "low",
+  arrival_time_category = "day",
+  arrival_weekday_cat = "weekday",
+  season = "summer",
+  season_simple = "non_winter",
+  crowd_cat = "low"
+)
+
+data <- data |>
+  mutate(
+    across(where(is.character), as_factor)
+  )
+
+for (col in names(factors_ref_levels)) {
+  if (col %in% names(data)) {
+    ref_level <- factors_ref_levels[[col]]
+    data[[col]] <- fct_relevel(data[[col]], ref_level)
+  }
+}
+
+data <- data |> droplevels()
+```
+
+# Export File
+
+```{r export_file}
+saveRDS(
+  data,
+  file = "./data/processed/data_preprocessed.RDS"
+)
+```

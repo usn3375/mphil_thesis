@@ -1,0 +1,293 @@
+---
+title: "Multiple Imputation"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+# Load Data and Packages
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+```{r load_data}
+library(librarian)
+shelf(
+  ggplot2,
+  naniar,
+  kableExtra,
+  misty,
+  mice,
+  ggmice,
+  future,
+  data.table,
+  tidytable,
+)
+
+data <- readRDS("./data/processed/data_preprocessed.RDS") |>
+  as.data.table()
+```
+
+# Summarise Missingness
+
+```{r analyse_miss, warning = FALSE}
+na_count_variables <- colSums(is.na(data))
+
+missing_data_summary <- data.table(
+  variable  = names(na_count_variables),
+  n_missing = na_count_variables,
+  proportion_missing = round((na_count_variables / nrow(data))*100, digits = 2),
+  row.names = NULL
+  ) |>
+  arrange(desc(proportion_missing))
+
+fc_target_NA_frac <- function(data) {
+  NA_count <- data |>
+    filter(if_any(c("AcuityScore", "ArrivalMode", "ReferralSource"), is.na)) |>
+    nrow()
+  
+  NA_frac <- 100*(NA_count / nrow(data)) |>
+    round(digits = 3)
+  
+  return(NA_frac)
+}
+
+NA_frac_raw <- fc_target_NA_frac(data)
+
+test <- data |>
+  select(c("AcuityScore", "ArrivalMode", "ReferralSource")) |>
+  na.test()
+```
+
+```{r table}
+kable(missing_data_summary)
+
+# plot of the relevant variables with missingness
+# did it for all the other variables as well, but left these out for 
+# readability in the final markdown.
+data |>
+  select("AcuityScore", "ArrivalMode", "ReferralSource") |>
+  gg_miss_upset()
+```
+
+* The outcome variable `next_event_death` does not contain any missing data.
+* There is a lot of `NA` for all data related to death, admissions, and inpatient stays. This is because everyone who did not die or did not have an inpatient stay after an ED visit has `NA` in these columns.
+* The variables `InitialNursingAssessment` and `InitialMedicalAssessment` are recorded unreliably and MNAR cannot be ruled out (according to the ED physician). They are not included in further analyses.
+* This leaves us with three variables of relevance for later analysis which have missing data: `AcuityScore`, `ArrivalMode`, `ReferralSource`. In the dataset, `NA_frac_raw`% of rows have missing data in one or more of these variables.
+* Relations of missing data were plotted using `narniar::gg_miss_upset(data)`.
+* Little MCARs test was significant (p<0.001), therefore we can't assume missingness completely at random (MCAR). (https://doi.org/10.1016/j.jclinepi.2022.08.016).
+* According to domain knowledge (ED physician), MAR is a reasonable assumption for the missing data in the four variables.
+
+# Multiple Imputation - all visits
+
+* For some analyses, a data set containing only the first ED visit is needed.
+* To avoid biasing the imputations for the dataset with only the first ED visit, two seperate imputations are run, one including all visits and another with only the first ED visit.
+* The risk of bias would arise as the imputation uses data that is "outside" of the single-visit data to replace missing values.
+
+## Set Imputation Targets
+
+* Here we define the variables that are to be imputed (target variables).
+* Every non-target variable is set not to be imputed.
+* Then, the imputation method for each target variable is defined.
+  * `AcuityScore` has three levels, therefore polytomous regression is used.
+  * `ArrivalMode` and `ReferralSource` have two levels, therefore logistic regression is used.
+
+```{r imp_targets}
+target_vars <- c(
+  "AcuityScore",
+  "ArrivalMode",
+  "ReferralSource"
+)
+
+# Identify variables that are not in target_vars
+all_vars <- names(data)
+non_targets <- all_vars[!all_vars %in% target_vars]
+
+# make method matrix and exclude non-targets from imputation
+meth <- make.method(data)
+meth[non_targets] <- ""
+
+# manually set imputation model for targets for reproducibility
+meth["AcuityScore"] <- "polyreg"
+meth["ArrivalMode"] <- "logreg"
+meth["ReferralSource"] <- "logreg"
+```
+
+## Set Prediction Matrix
+
+* We define the variables that serve as predictors in the imputation model.
+* I included all variables that are important for the relation to death and well recorded. This is done using domain knowledge.
+
+```{r imp_preds}
+pred_vars <- c(
+  "AcuityScore",
+  "ArrivalMode",
+  "ReferralSource",
+  "AdmittingWard",
+  "Gender",
+  "AgeonArrival",
+  "CovidCohort",
+  "Area",
+  "FirstNEWS",
+  "LastSpecialty",
+  "VisitTypePlannedReturn",
+  "CareHomeBinary",
+  "att_reason_mortality",
+  "next_event_death",
+  "attendance_count",
+  "arrival_hour",
+  "arrival_weekday",
+  "season",
+  "EDLOS_hours",
+  "ed_occupancy_at_arrival"
+)
+```
+
+* The imputation matrix is then created in several steps. Everything is zero-ed out first, and then only the predictors defined above are used as covariates in the model.
+* Self-prediction of imputed variables is explicitly blocked. This is necessary, because step 3 in the code block would introduce self-prediction otherwise
+
+```{r pred_matrix}
+# 1. create raw prediction matrix
+pred <- make.predictorMatrix(data)
+
+# 2. zero everything out
+pred[ , ] <- 0
+
+# 3. use selected predictors for targets
+for (var in target_vars) {
+  pred[var, pred_vars] <- 1
+}
+
+# 4. block self-prediction of imputed variables
+diag(pred) <- 0
+```
+
+```{r}
+# optional: plot predition matrix to check if correct
+# was used for convenient building of the matrix
+plot_pred <- plot_pred(pred)
+```
+
+## Run Multiple Imputation with Chained Equations
+
+* Main reference: https://pmc.ncbi.nlm.nih.gov/articles/PMC8499698/
+* The number of imputations `m` is recommended to be at least as high as the percentage of rows with missingness (see also https://doi.org/10.1002/sim.4067). We have ```r fc_target_NA_frac(data)```% of rows with missing data among the relevant variables. It was decided to run `m = 10` imputations to exceed that recommendation. 
+* The recommended number of iterations `maxit` per imputed datasets is more than 5. `maxit = 30` was chosen and the convergence of imputed values was assessed in a trace plot and the chosen `maxit` value was judged to be sufficient.
+
+```{r allvisits_mice}
+imp <- mice(
+  data,
+  m = 10,
+  maxit  = 30,
+  method = meth,
+  predictorMatrix = pred,
+  seed   = 123
+)
+```
+
+## Diagnostics
+
+* Trace plot of means and standard deviations of imputed variables to assess convergence of the chains across datasets.
+* The plots show good mixing and convergence across chains.
+
+```{r trace_plot}
+imp_plot_convergence <- plot_trace(imp) |> plot()
+```
+
+## Data Export
+
+```{r export_file}
+ggsave(
+  filename = "./output/figures/misc/mice_trace_allvisits.pdf",
+  plot   = imp_plot_convergence,
+  width  = 6.2,
+  height = 4.2,
+  units  = "in"
+)
+
+saveRDS(
+  imp,
+  file = "./data/processed/data_mids_allvisits.RDS"
+)
+```
+
+```{r, echo = FALSE}
+rm(imp)
+```
+
+# Multiple Imputation - 1st ED visit only
+
+* Over the course of the project, some analyses have been done with the first ED visit only.
+* A separate imputation is run for this to reduce the risk of bias in imputations. This approach avoids imputing the data with observations as predictors that are excluded from later analysis.
+
+```{r}
+data_single <- data |> filter(attendance_count == 1)
+```
+
+## Imputation target
+
+The same imputation target matrix from the first multiple imputation can be used.
+
+## Prediction Matrix
+
+* Exclude attendance number from the predictors.
+* The rest can be re-used from the first imputation.
+
+```{r}
+pred_vars_single <- pred_vars[pred_vars != "attendance_count"]
+```
+
+## Run Multiple Imputation
+
+* The percentage of missingness is comparable to the repeat visits (```r fc_target_NA_frac(data)```% of observations have missing data).
+* The same imputation settings are used again.
+
+```{r single_mice}
+imp_single <- mice(
+  data_single,
+  m = 10,
+  maxit  = 30,
+  method = meth,
+  predictorMatrix = pred,
+  seed   = 123
+)
+```
+
+## Diagnostics
+
+```{r}
+imp_plot_convergence <- plot_trace(imp_single) |> plot()
+```
+
+## Data Export
+
+```{r}
+ggsave(
+  filename = "./output/figures/misc/mice_trace_firstvisit.pdf",
+  plot   = imp_plot_convergence,
+  width  = 6.2,
+  height = 4.2,
+  units  = "in"
+)
+
+saveRDS(
+  imp_single,
+  file = "./data/processed/data_mids_firstvisit.RDS"
+)
+```
