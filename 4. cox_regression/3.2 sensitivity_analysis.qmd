@@ -1,0 +1,271 @@
+---
+title: "Survival Model"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+options(scipen = 999)
+```
+
+# Prep Data and Functions
+
+```{r}
+library(librarian)
+shelf(
+  mice,
+  ggplot2,
+  patchwork,
+  kableExtra,
+  stringr,
+  marginaleffects,
+  broom,
+  margins,
+  survival,
+  data.table,
+  tidytable,
+  quiet = TRUE
+)
+
+data <- readRDS("./data/processed/data_mids_allvisits.RDS")
+data_comp <- mice::complete(data)
+
+source("./programs/helper_scripts/survival_hr_pool_estim.R")
+source("./programs/helper_scripts/survival_hr_tex_table.R")
+source("./programs/helper_scripts/survival_predict_spline.R")
+source("./programs/helper_scripts/survival_pool_spline.R")
+source("./programs/helper_scripts/survival_plot_spline.R")
+source("./programs/helper_scripts/plot_theme.R")
+
+fc_long <- function(data) {
+  return(
+    data |>
+      mice::complete("long", include = TRUE) |>
+      as.data.table()
+  )
+}
+```
+
+# Reference Data for Partial Effects
+```{r}
+set.seed(123)
+ed_grid <- seq(
+  from = min(data_comp$ed_occupancy_at_arrival),
+  to   = max(data_comp$ed_occupancy_at_arrival),
+  length.out = 1000
+)
+
+ref_vals <- data_comp |>
+  summarize(
+    Gender = "F",
+    AgeonArrival   = median(AgeonArrival),
+    ReferralSource = "non_clinical",
+    ArrivalMode    = "non_ambulance",
+    Area = "non_resus",
+    CovidCohort = "no_isolation",
+    FirstNEWS   = median(FirstNEWS),
+    AcuityScore = "3-4",
+    att_reason_mortality = "low",
+    AdmittedNonAdmitted = "non_admitted",
+    icu_admission = 0L,
+    CareHomeBinary = 0L,
+    arrival_weekday_cat   = "weekday",
+    arrival_time_category = "day",
+    EDLOS_hours = median(EDLOS_hours),
+    attendance_count_cat = "1"
+  )
+
+ref_data <- ed_grid |>
+  enframe(name = NULL, value = "ed_occupancy_at_arrival") |>
+  bind_cols(ref_vals[rep(1, length(ed_grid)),])
+```
+
+# Use Crowding 'Categories'
+
+## Prep Data
+
+```{r}
+sens_1_data <- data |>
+  fc_long() |>
+  mutate(
+    crowding_category = case_when(
+      crowding_percentile > 0.80 ~ "high",
+      crowding_percentile < 0.50  ~ "low",
+      TRUE ~ "mid"
+    ),
+    crowding_category = factor(
+      crowding_category,
+      levels = c("low", "mid", "high")
+    )
+  ) |>
+  as.mids()
+```
+
+## Fit Model
+
+```{r}
+sens_1_model <- with(
+  sens_1_data,
+  coxph(
+    Surv(start_time_30_lt, stop_time_30_lt, next_event_death_30_lt) ~
+      Gender +
+      AgeonArrival +
+      ReferralSource +
+      icu_admission +
+      FirstNEWS +
+      AcuityScore +
+      att_reason_mortality +
+      arrival_weekday_cat +
+      arrival_time_category +
+      EDLOS_hours * AdmittedNonAdmitted +
+      crowding_category +
+      ArrivalMode +
+      strata(Area) +
+      strata(CovidCohort) +
+      strata(CareHomeBinary) +
+      cluster(id)
+    )
+)
+```
+
+## Results
+
+```{r, echo = F}
+sens_1_estim <- fc_tidy_estim(sens_1_model) |>
+  mutate(
+    term = case_when(
+      str_detect(term, "mid$") ~ "ED Crowding: moderate",
+      str_detect(term, "high$") ~ "ED Crowding: high",
+      TRUE ~ term
+    )
+  )
+
+kable(sens_1_estim, digits = 3)
+
+fc_estim_latex_tab(sens_1_estim) |>
+  writeLines(
+  "./output/tables/survival_model/sensitivity/crowd_cat_estim.tex"
+  )
+```
+
+
+# Logistic Regression
+
+```{r}
+fit_logit <- with(
+  data_comp,
+  glm(
+    death30_binary ~
+    Gender +
+    AgeonArrival +
+    ReferralSource +
+    icu_admission +
+    FirstNEWS +
+    AcuityScore +
+    att_reason_mortality +
+    arrival_weekday_cat +
+    arrival_time_category +
+    EDLOS_hours * AdmittedNonAdmitted +
+    ed_occupancy_at_arrival +
+    CovidCohort +
+    CareHomeBinary +
+    Area +
+    ArrivalMode,
+  family = binomial
+  )
+)
+
+ame_crowding <- avg_slopes(
+  fit_logit,
+  vcov    = sandwich::vcovCL(fit_logit, cluster = ~ id)
+)
+
+ame_crowding |> tidy()
+
+ame_crowding |>
+  mutate(across(where(is.numeric), round, 5)) |>
+  select(term, contrast, estimate, conf.low, conf.high, p.value) |>
+  mutate(
+    Estimate_CI = paste0(estimate, " (", conf.low, ", ", conf.high, ")"),
+    Signif = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ ""
+    ),
+    p.value = ifelse(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value)),
+    p_value_styled = paste0(p.value, Signif)
+  ) |>
+  select(term, contrast, Estimate_CI, p_value_styled) |>
+  kable(
+      digits = 3,
+      format = "latex",
+      booktabs = TRUE,
+      align = c("l","l","l","l")
+    ) |>
+  writeLines(
+  "./output/tables/survival_model/sensitivity/logit_all.tex"
+  )
+
+robust_summary <- broom::tidy(fit_logit, conf.int = TRUE, vcov = robust_vcov)
+
+test <- robust_summary |>
+  mutate(
+      odds.ratio  = exp(estimate),
+      or.ci95.upper = exp(estimate + 1.96 * std.error),
+      or.ci95.low   = exp(estimate - 1.96 * std.error)
+  )
+      
+fc_estim_latex_tab <- function(esimate_df) {
+  
+  tex_ready <- esimate_df |> 
+    mutate(
+      across(where(is.numeric), round, 3),
+      ci.95.comb = paste0("(", or.ci95.low, "-", or.ci95.upper, ")"),
+      `Log-Odds (Std.Error)` = paste0(estimate, " (", std.error, ")"),
+      signif = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        TRUE ~ ""
+      ),
+      p.value = as.character(p.value),
+      p.value = fifelse(p.value == "0", "<0.001", p.value),
+      `P-Value` = paste0(p.value, signif),
+      `Odds Ratio (95%CI)` = paste(odds.ratio, ci.95.comb)
+    ) |>
+    select(term, `Log-Odds (Std.Error)`, `Odds Ratio (95%CI)`, `P-Value`) |>
+    kable(
+      digits = 3,
+      format = "latex",
+      booktabs = TRUE,
+      align = c("l","l","l","l","l")
+    )
+  
+  return(tex_ready)
+}
+
+fc_estim_latex_tab(test) |>
+  writeLines(
+  "./output/tables/survival_model/sensitivity/logit_all_OR.tex"
+  )
+```
+

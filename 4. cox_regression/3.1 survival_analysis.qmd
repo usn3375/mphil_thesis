@@ -1,0 +1,663 @@
+---
+title: "Survival Model"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+options(scipen = 999)
+```
+
+# Data and packages
+
+```{r}
+library(librarian)
+shelf(
+  mice,
+  ggplot2,
+  patchwork,
+  kableExtra,
+  stringr,
+  broom,
+  survival,
+  easysurv,
+  data.table,
+  tidytable,
+  quiet = TRUE
+)
+
+source("./programs/helper_scripts/survival_hr_pool_estim.R")
+source("./programs/helper_scripts/survival_hr_tex_table.R")
+source("./programs/helper_scripts/plot_theme.R")
+
+data <- readRDS("./data/processed/data_mids_allvisits.RDS")
+```
+
+# Fit the Model
+
+```{r fit_model}
+surv_fit <- with(
+  data,
+  coxph(
+    Surv(start_time_30_lt, stop_time_30_lt, next_event_death_30_lt) ~
+      Gender +
+      AgeonArrival +
+      ReferralSource +
+      icu_admission +
+      FirstNEWS +
+      AcuityScore +
+      att_reason_mortality +
+      arrival_weekday_cat +
+      arrival_time_category +
+      EDLOS_hours * AdmittedNonAdmitted +
+      pspline(ed_occupancy_at_arrival) +
+      ArrivalMode +
+      strata(Area) +
+      strata(CovidCohort) +
+      strata(CareHomeBinary) +
+      cluster(id)
+    )
+)
+
+test <- mice::pool(surv_fit)
+summary(test)
+```
+
+# Report Results
+
+## Regression Estimates
+
+* First, they are pooled with the `mice::pool` function. It uses Rubin's rule in the background.
+* Then, the regression estimates are tidied.
+* The spline estimates return NA because splines are a function and cannot be pooled using Rubin's rule. These rows are removed.
+* The estimates are given more legible names for the following plots and tables.
+
+```{r}
+tidy_estim <- fc_tidy_estim(surv_fit)
+```
+
+```{r, echo = F}
+kable(tidy_estim, digits = 3)
+```
+
+The table is made prettier and exported into LaTeX code for the thesis.
+
+```{r}
+fc_estim_latex_tab(tidy_estim) |>
+  writeLines(
+  "./output/tables/survival_model/survival_estim.tex"
+  )
+```
+
+## Dot-Whisker Plot of Estimates
+
+The point estimates and their 95% CI are visualised as a dot-whisker plot.
+
+```{r}
+# add indicator vars for easy grey shading
+shading <- tidy_estim |>
+  mutate(ypos = row_number()) |>
+  filter(ypos %% 2 == 0) |>
+  mutate(
+    ymin = ypos - 0.5,
+    ymax = ypos + 0.5
+  )
+
+plot_dotwhisker <- ggplot(tidy_estim, aes(x = hazard.ratio, y = term)) +
+  geom_rect(
+    data = shading,
+    aes(ymin = ypos - 0.5, ymax = ypos + 0.5),
+    xmin = -Inf, xmax = log10(8),
+    fill = "gray70", alpha = 0.3,
+    inherit.aes = FALSE
+  ) +
+  geom_vline(xintercept = 1, linetype = "dotted", color = "gray50") +
+  geom_errorbarh(aes(xmin = hr.ci95.low, xmax = hr.ci95.upper), height = 0.2) +
+  geom_point(size = 1.5) +
+  scale_x_log10(
+    breaks = c(0.5, 1, 2, 4, 8),
+    limits = c(0.5, 8),
+    labels = function(x) ifelse(x %% 1 == 0, as.character(x), as.character(x))
+  ) +
+  labs(
+    x = "Hazard ratio: death within 30 days",
+    y = "Covariate"
+  ) +
+  basic_theme
+
+plot_dotwhisker
+```
+
+## Partial Effects Plot of Spline
+
+A partial effects plot of the spline function is created to interpret the effect of the ED occupancy spline on the Hazard Ratio. As we have multiple splines (one from each imputed data set), we run the partial effects plot once for each imputed data set. The resulting plot shows the functional form of the spline.
+
+### Prediction Grid
+
+* First, a grid of 1000 ED occupancy values is created.
+* Then, reasonable reference values for all other variables are set. This is either the mode of a categorical variable, or the median of a continuous one.
+
+```{r}
+data_comp  <- mice::complete(data)
+
+set.seed(123)
+ed_grid <- seq(
+  from = min(data_comp$ed_occupancy_at_arrival),
+  to   = max(data_comp$ed_occupancy_at_arrival),
+  length.out = 1000
+)
+
+ref_vals <- data_comp |>
+  summarize(
+    Gender = "F",
+    AgeonArrival   = median(AgeonArrival),
+    ReferralSource = "non_clinical",
+    ArrivalMode    = "non_ambulance",
+    Area = "non_resus",
+    CovidCohort = "no_isolation",
+    FirstNEWS   = median(FirstNEWS),
+    AcuityScore = "3-4",
+    att_reason_mortality = "low",
+    AdmittedNonAdmitted = "non_admitted",
+    icu_admission = 0L,
+    CareHomeBinary = 0L,
+    arrival_weekday_cat   = "weekday",
+    arrival_time_category = "day",
+    EDLOS_hours = median(EDLOS_hours),
+    attendance_count_cat = "1"
+  )
+
+ref_data <- ed_grid |>
+  enframe(name = NULL, value = "ed_occupancy_at_arrival") |>
+  bind_cols(ref_vals[rep(1, length(ed_grid)),])
+```
+
+### Predict all Spline Term from Multiple Imputations
+
+* We have a separate spline term for every imputed data set.
+* The partial effect of the spline is predicted for every data set.
+* All results are combined into a single list.
+* The HR is centred at the mean occupancy level, to allow interpretation relative to that.
+
+```{r predict_spline}
+fc_crowd_spline_pred <- function(model_name, newdata = ref_data) {
+  
+  imp_models <- model_name$analyses
+  pred_list <- vector("list", length(imp_models))
+
+  crowd_ref_value <- median(data_comp$ed_occupancy_at_arrival)
+  
+  # Create reference row for centering
+  ref_row <- newdata[1, ]
+  ref_row$ed_occupancy_at_arrival <- crowd_ref_value
+  
+  # Loop over imputations
+  for (i in seq_along(imp_models)) {
+    mod <- imp_models[[i]]
+    
+    # predict spline for full grid
+    pr_grid <- predict(
+      mod,
+      newdata = newdata,
+      type    = "terms",
+      se.fit  = TRUE
+    )
+    
+    # save spline term
+    term_lab <- grep(
+      "ed_occupancy_at_arrival",
+      colnames(pr_grid$fit),
+      value = TRUE
+    )
+    
+    # Predict spline for ref
+    pr_ref <- predict(
+      mod,
+      newdata = ref_row,
+      type    = "terms"
+    )
+    fit_ref <- pr_ref[, term_lab]
+    
+    # Center predictions at reference value
+    centered_fit <- pr_grid$fit[, term_lab] - fit_ref
+    
+    pred_list[[i]] <- data.table(
+      imp = i,
+      x   = newdata$ed_occupancy_at_arrival,
+      fit = centered_fit,
+      se  = pr_grid$se.fit[, term_lab],
+      crowd_ref_value = crowd_ref_value 
+    )
+  }
+  
+  prediction_dt <- rbindlist(pred_list)
+  return(prediction_dt)
+}
+
+spline_pred <- fc_crowd_spline_pred(surv_fit)
+```
+
+The function is export into a helper script to be re-used in the sensitivity analyses.
+
+```{r}
+dump(
+  "fc_crowd_spline_pred",
+  file = "./programs/helper_scripts/survival_predict_spline.R"
+)
+```
+
+### Pool Spline Estimates
+
+* The `mice::pool()` function cannot be readily used here.
+* Rubin's rule is therefore applied manually.
+* The formulas are obtained from here: https://bookdown.org/mwheymans/bookmi/rubins-rules.html
+
+```{r}
+fc_pool_rubins <- function(model_name, prediction_dt) {
+  m <- length(model_name)
+  
+  pooled_pred <- prediction_dt |>
+    group_by(x) |>
+    summarize(
+      theta_bar = mean(fit), # pooled estimate
+      U_bar = mean(se^2), # within-imputation variance
+      B = var(fit) # between-imputation variance
+    ) |>
+    ungroup() |>
+    mutate(
+      T_var = U_bar + (1 + 1 / m) * B, # total variance
+      se_total = sqrt(T_var), # total standard error
+      HR = exp(theta_bar), 
+      lower_CI = exp(theta_bar - 1.96 * se_total),
+      upper_CI = exp(theta_bar + 1.96 * se_total)
+    )
+  
+  return(pooled_pred)
+}
+
+pooled_pred <- fc_pool_rubins(surv_fit,spline_pred)
+```
+
+It is exported into a helper script for future use.
+
+```{r}
+dump(
+  "fc_pool_rubins",
+  file = "./programs/helper_scripts/survival_pool_spline.R"
+)
+```
+
+### Plot Predicted Values
+
+* The spline function with the pointwise 95% CI is plotted.
+* A density plot of the ED occupancy is added to the upper margin of the plot to show the distribution of occupancy values.
+
+```{r}
+ m_occ <- median(data_comp$ed_occupancy_at_arrival)
+
+fc_plot_spline <- function(pooled_pred_data) {
+  
+  m_occ <- median(data_comp$ed_occupancy_at_arrival)
+  
+  spline_plot <- ggplot(pooled_pred_data, aes(x = x, y = HR)) +
+      annotate(
+        "segment",
+        x = -Inf, xend = 174, y = 1, yend = 1,
+        linetype = "dotted",
+        color = "gray30") +
+      annotate(
+        "segment",
+        x = m_occ, xend = m_occ, y = -Inf, yend = Inf,
+        linetype = "dotted",
+        color = "gray30"
+      ) +
+      geom_ribbon(aes(ymin = lower_CI, ymax = upper_CI), alpha=0.4, fill="lightblue") +
+      geom_line(color="blue3", linewidth=0.75) +
+      #geom_vline(xintercept = mean(data_comp$ed_occupancy_at_arrival)) +
+      labs(
+        x = "ED occupancy at arrival time\n(no. of patients)",
+        y = "Hazard ratio: death within 30 days"
+      ) +
+      scale_x_continuous(limits = c(0,175), breaks = seq(0,175,25)) +
+      scale_y_continuous(limits = c(0.7,2), breaks = seq(0.75, 2,0.25)) +
+      basic_theme
+  
+  return(spline_plot)
+}
+
+plot_spline <- fc_plot_spline(pooled_pred)
+
+# density plot
+plot_density <- ggplot(data = data_comp, aes(x = ed_occupancy_at_arrival)) +
+  geom_density(fill = "gray90", color = "gray75") +
+  labs(x = NULL, y = "Density") +
+  scale_x_continuous(limits = c(0,175), breaks = seq(0,175,25)) +
+  basic_theme +
+  annotate(
+    "segment",
+    x = m_occ, xend = m_occ, y = 0.0001, yend = Inf,
+    linetype = "dotted",
+    color = "gray30"
+  ) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.line.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# combine plots
+plot_spline_combined <- plot_density/plot_spline +
+  plot_layout(heights = c(1,5))
+```
+
+```{r, echo = F}
+plot(plot_spline_combined)
+
+dump(
+  "fc_plot_spline",
+  file = "./programs/helper_scripts/survival_plot_spline.R"
+)
+
+ggsave(
+  filename = "./output/figures/survival_model/agmodel_spline.pdf",
+  plot   = plot_spline_combined,
+  width  = 6,
+  height = 6
+)
+```
+
+### Point-wise Estimates
+
+* Creates a table with the point-wise estimates for every 10th percentile. Goes into the appendix. (find the closest occupancy value to each 10th percentile)
+
+```{r}
+crowd_percentile <- data_comp |>
+  select(ed_occupancy_at_arrival, crowding_percentile) |>
+  distinct(ed_occupancy_at_arrival, .keep_all = TRUE)
+
+targets <- seq(0, 1, by = 0.1)
+list_percentiles <- vector("list", length(targets))
+
+for (i in seq_along(targets)) {
+  t <- targets[i]
+  list_percentiles[[i]] <- crowd_percentile |>
+    slice_min(abs(crowding_percentile - t), 
+              n = 1, with_ties = FALSE) |>
+    mutate(crowding_percentile = t)
+}
+
+crowd_percentile <- rbindlist(list_percentiles)
+
+spline_percentiles_tidy <- pooled_pred |>
+  mutate(x = round(x, 0)) |>
+  distinct(x, .keep_all = T) |>
+  rename(ed_occupancy_at_arrival = x) |>
+  inner_join(
+    crowd_percentile,
+    by = "ed_occupancy_at_arrival"
+  )
+```
+
+```{r, echo = F}
+spline_percentiles_tex <- spline_percentiles_tidy |>
+  mutate(
+    crowding_percentile = crowding_percentile * 100,
+    crowding_percentile = as.character(crowding_percentile),
+    crowding_percentile = paste0("P",crowding_percentile),
+    across(where(is.numeric), round, 3),
+    across(where(is.numeric), as.character),
+    `HR (95%CI)` = paste0(HR, " (", lower_CI, "-", upper_CI, ")"),
+    `(Percentile)` = paste0("(", crowding_percentile, ")"),
+    `ED Occupancy at Arrival` = ed_occupancy_at_arrival
+  ) |>
+  select(
+    `ED Occupancy at Arrival`,
+    `(Percentile)`,
+    `HR (95%CI)`
+  )
+
+kable(spline_percentiles_tex)
+
+spline_percentiles_tex <- spline_percentiles_tex |>
+  kable(
+    digits = 3,
+    format = "latex",
+    booktabs = TRUE,
+    align = c("l","l","l")
+  ) |>
+  writeLines(
+  "./output/tables/survival_model/spline_point_estimates.tex"
+  )
+```
+
+### Significant deviations from HR = 1
+
+Significant results are selected and divided into two segements (the 95%CI does not cross HR=1 in two different locations).
+
+```{r}
+pred_signif <- pooled_pred |>
+  rename(occ = x) |>
+  filter(upper_CI < 1 | lower_CI > 1) |>
+  mutate(occ = round(occ, digits = 0)) |>
+  arrange(occ) |>
+  mutate(occ_diff = occ - lag(occ))
+
+# index of the largest gap
+split_index <- which.max(pred_signif$occ_diff)
+
+seg_1 <- pred_signif |>
+  slice(1:split_index - 1) |>
+  pull(occ) |>
+  range()
+
+seg_2 <- pred_signif |>
+  slice((split_index):n()) |>
+  pull(occ) |>
+  range()
+
+seg_1_min <- min(seg_1)
+seg_1_max <- max(seg_1)
+seg_2_min <- min(seg_2)
+seg_2_max <- max(seg_2)
+
+spline_nadir_occ <- pooled_pred |>
+  slice_min(HR) |>
+  round(0) |>
+  pull(x)
+```
+
+```{r}
+# captures the nearest recorded value and its percentile
+fc_occ_percentile <- function(occ_value) {
+  spline_occ_percentile <- data_comp |>
+    distinct(ed_occupancy_at_arrival, .keep_all = TRUE) |>
+    mutate(diff = abs(ed_occupancy_at_arrival - occ_value)) |>
+    slice_min(order_by = diff, n = 1, with_ties = FALSE) |>
+    pull(crowding_percentile) |>
+    {\(x) round(100 * x, digits = 0)}()
+ return(spline_occ_percentile) 
+}
+
+seg_1_min_p <- fc_occ_percentile(seg_1_min)
+seg_1_max_p <- fc_occ_percentile(seg_1_max)
+
+seg_2_min_p <- fc_occ_percentile(seg_2_min)
+seg_2_max_p <- fc_occ_percentile(seg_2_max)
+
+spline_nadir_p <- fc_occ_percentile(spline_nadir_occ)
+```
+
+* Range of the first significant segment: ```r seg_1_min```-```r seg_1_max``` (percentiles: ```r seg_1_min_p```-```r seg_1_max_p```)
+* Range of the second significant segment: ```r seg_2_min``` - ```r seg_2_max``` (percentiles: ```r seg_2_min_p```-```r seg_2_max_p```)
+* Nadir of HR point estimates: ```r spline_nadir_occ``` (percentile: ```r spline_nadir_p```).
+
+### Zoomed Spline Plot
+
+* For better visibility of the functional shape of the spline.
+* The bottom 1% and top 1% of occupancy values are cut-out.
+* The grid of ED-values is re-build with these contraints
+
+```{r}
+p_1 <- data_comp |>
+  filter(crowding_percentile < 0.01) |>
+  slice_max(ed_occupancy_at_arrival) |>
+  distinct(ed_occupancy_at_arrival) |>
+  pull()
+
+p_99 <- data_comp |>
+  filter(crowding_percentile > 0.99) |>
+  slice_min(ed_occupancy_at_arrival) |>
+  distinct(ed_occupancy_at_arrival) |>
+  pull()
+
+ed_grid_trunc <- seq(
+  from = p_1,
+  to   = p_99,
+  length.out = 1000
+)
+
+ref_data_trunc <- ed_grid_trunc |>
+  enframe(name = NULL, value = "ed_occupancy_at_arrival") |>
+  bind_cols(ref_vals[rep(1, length(ed_grid_trunc)),])
+
+spline_pred_trunc <- fc_crowd_spline_pred(
+  surv_fit,
+  newdata = ref_data_trunc
+)
+
+pooled_pred_trunc <- fc_pool_rubins(
+  surv_fit,prediction_dt = spline_pred_trunc
+)
+```
+
+```{r, echo = F}
+plot_spline_trunc <- ggplot(
+  pooled_pred_trunc, aes(x = x, y = HR)) +
+  annotate(
+    "segment",
+    x = -Inf, xend = 140, y = 1, yend = 1,
+    linetype = "dotted",
+    color = "gray30"
+  ) +
+  annotate(
+    "segment",
+    x = median(data_comp$ed_occupancy_at_arrival), xend = median(data_comp$ed_occupancy_at_arrival), y = -Inf, yend = 1.3,
+    linetype = "dotted",
+    color = "gray30"
+  ) +
+geom_ribbon(aes(ymin = lower_CI, ymax = upper_CI), alpha = 0.4, fill = "lightblue") +
+  geom_line(color = "blue3", linewidth = 0.75) +
+  # geom_vline(xintercept = mean(data_comp$ed_occupancy_at_arrival)) +
+  labs(
+    x = "ED occupancy at arrival time\n(no. of patients)",
+    y = "Hazard ratio: death within 30 days"
+  ) +
+  scale_y_continuous(limits = c(0.8, 1.4), breaks = seq(0.8, 1.3, 0.1)) +
+  scale_x_continuous(limits = c(25, 140), breaks = seq(30, 140, 10)) +
+  basic_theme
+
+plot(plot_spline_trunc)
+
+ggsave(
+  filename = "./output/figures/survival_model/agmodel_spline_zoom.pdf",
+  plot   = plot_spline_trunc,
+  width  = 6,
+  height = 6
+)
+```
+
+# Model Diagnostics
+
+This was done for all the 10 fitted, multiply imputed models.
+They are very similar, and therefore only the first model diagnostics are shown for the sake of clarity and brevity.
+
+```{r}
+model_diag <- surv_fit$analyses[[1]]
+```
+
+## Model Concordance
+
+* A measure of how correctly the model ranks survival times.
+* Not very important if modelling for inference, but it achieves very high concordance
+
+```{r}
+summary(model_diag) |>
+  pull(concordance) |>
+  print()
+```
+
+## Schoenfeld Residuals
+
+```{r}
+resid_plot <- model_diag |>
+  cox.zph() |>
+  get_schoenfeld() |>
+  plot_schoenfeld(hline = FALSE) +
+  facet_wrap(~ variable, ncol = 2, scales = "free_y")
+
+# transparency of scatter points
+resid_plot$layers[[1]]$aes_params$alpha <- 0.25
+
+plot(resid_plot)
+```
+
+```{r, echo = F}
+ggsave(
+  filename = "./output/figures/survival_model/plot_schoenfeld.pdf",
+  plot   = resid_plot,
+  width  = 6,
+  height = 11
+)
+```
+
+## Martingale Residuals
+
+```{r}
+martingale_res <- residuals(model_diag, type = "martingale")
+
+plot_martingale <- function(x_col) {
+  x_values <- data_comp[[x_col]]
+  plot(
+    x_values, martingale_res,
+    xlab = x_col,
+    ylab = "Martingale Residuals",
+    main = paste("Martingale Residuals vs", x_col)
+    )
+  lines(smooth.spline(x_values, martingale_res), col = "blue")
+}
+```
+
+### Age
+
+```{r}
+plot_martingale("AgeonArrival")
+```
+
+### NEWS Score
+
+```{r}
+plot_martingale("FirstNEWS")
+```
+
+### EDLOS
+
+```{r}
+plot_martingale("EDLOS_hours")
+```
