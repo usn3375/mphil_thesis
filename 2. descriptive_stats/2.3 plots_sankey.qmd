@@ -1,0 +1,178 @@
+---
+title: "SSankey Diagram"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+```
+
+# Load Data
+
+```{r}
+library(librarian)
+shelf(
+  stringr,
+  networkD3,
+  htmlwidgets,
+  webshot,
+  data.table,
+  tidytable
+)
+
+# webshot::install_phantomjs()
+
+data <- readRDS("./data/processed/data_clean.RDS") |>
+  as.data.table()
+```
+
+# Create Data for Sankey
+
+The variable names and levels are "pre-cleaned". It's easier to change them now than after plotting.
+
+```{r}
+data <- data |>
+  dplyr::filter_at(
+    dplyr::vars(
+      ReferralSource,
+      ArrivalMode,
+      Area,
+      AdmittedNonAdmitted,
+      AdmittingWard
+    ),
+    dplyr::all_vars(!is.na(.))
+  ) |>
+  mutate(
+    ReferralSource = fifelse(
+      ReferralSource == "clinical",
+      "Physician referral",
+      "Non-physician referral"
+    ),
+    ArrivalMode = fifelse(
+      ArrivalMode == "ambulance",
+      "Ambulance",
+      "Walk-in"
+    ),
+    Area = fifelse(
+      Area == "resus",
+      "Resus area",
+      "General ED"
+    ),
+    AdmittedNonAdmitted = fifelse(
+      AdmittedNonAdmitted == "non_admitted",
+      "Discharged",
+      "Admitted"
+    ),
+    AdmittingWard = fifelse(
+      AdmittingWard == "ICU",
+      "ICU",
+      "General wards"
+    )
+  )
+```
+
+Then, the nodes and edges for the sankey are created.
+
+```{r}
+fc_make_links <- function(data, from, to, filter_expr = NULL) {
+  if (!is.null(filter_expr)) {
+    data <- dplyr::filter(data, !!rlang::parse_expr(filter_expr))
+  }
+  data |>
+    dplyr::count(source = {{ from }}, target = {{ to }}, name = "value")
+}
+
+all_links <- list(
+  fc_make_links(data, ReferralSource, ArrivalMode),
+  fc_make_links(data, ArrivalMode, Area),
+  fc_make_links(data, Area, AdmittedNonAdmitted),
+  fc_make_links(data, AdmittedNonAdmitted, AdmittingWard,
+                filter_expr = "AdmittedNonAdmitted == 'Admitted'")
+  ) |>
+  bind_rows()
+
+nodes <- data.table(
+  name = unique(c(all_links$source, all_links$target)),
+  stringsAsFactors = FALSE) |>
+  arrange(
+    match(
+      name,
+      c(
+        "Physician referral",
+        "Non-physician referral",
+        "Ambulance",
+        "Walk-in",
+        "Resus area",
+        "General ED",
+        "Admitted",
+        "Discharged",
+        "ICU",
+        "General wards"
+      )
+    )
+  )
+
+all_links <- all_links |>
+  mutate(
+    source = match(source, nodes$name) - 1,
+    target = match(target, nodes$name) - 1
+  )
+```
+
+# Plot
+```{r}
+plot <- sankeyNetwork(
+  Links  = all_links,
+  Nodes  = nodes,
+  Source = "source",
+  Target = "target",
+  Value  = "value",
+  NodeID = "name",
+  fontSize    = 17,
+  nodeWidth   = 50,
+  sinksRight  = FALSE,
+  iterations  = 0,
+  nodePadding = 40,
+  width  = 1250,
+  height = 500
+)
+```
+
+```{r, echo = FALSE}
+plot
+```
+
+# Export PDF
+
+Has to be exported first to a `.html` and then to a `.pdf` in order to have it as a vector-graphic pdf file.
+
+```{r}
+saveWidget(
+  plot,
+  "./output/figures/misc/sankey_plot.html",
+  selfcontained = TRUE
+)
+
+webshot(
+  "./output/figures/misc/sankey_plot.html",
+  file = "./output/figures/descriptive/plot_sankey.pdf",
+  delay = 0.1
+)
+```

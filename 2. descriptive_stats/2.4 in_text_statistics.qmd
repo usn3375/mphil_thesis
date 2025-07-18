@@ -1,0 +1,139 @@
+---
+title: "In-Text Statistics"
+author: "USN 3375"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+options(scipen = 999)
+```
+
+```{r}
+library(librarian)
+shelf(
+  kableExtra,
+  data.table,
+  tidytable,
+  quiet = TRUE
+)
+
+data <- readRDS("./data/processed/data_preprocessed.RDS")
+data_id <- data |>
+  arrange(ArrivalDateTime) |>
+  distinct(id, .keep_all = T)
+
+kabler <- function(data) {data |> kable(digits = 3)}
+```
+
+
+# EDLOS
+
+```{r}
+data |>
+  summarise(
+    edlos_median = median(EDLOS_hours),
+    edlos_mad = mad(EDLOS_hours)
+  ) |>
+  kabler()
+```
+
+```{r}
+data |>
+  group_by(AdmittedNonAdmitted) |>
+  summarise(
+    edlos_median = median(EDLOS_hours),
+    edlos_mad = mad(EDLOS_hours)
+  ) |>
+  kabler()
+```
+
+# Crowding 
+## Crowding and Number of Patients
+
+```{r}
+fc_occ_range <- function(p_low, p_high) {
+  rng <- data |> 
+    filter(crowding_percentile > p_low & crowding_percentile < p_high) |> 
+    pull(ed_occupancy_at_arrival) |> 
+    range(na.rm = TRUE)
+  
+  paste(rng, collapse = "-")   # returns "min-max"
+}
+
+p10_20_range <- fc_occ_range(0.1,0.2)
+p80_90_range <- fc_occ_range(0.8,0.9)
+```
+
+* p10_20_range = ```r p10_20_range```
+* p80_90_range = ```r p80_90_range```
+
+## Crowding and EDLOS
+
+```{r}
+fc_crowd_edlos_p <- function(p_low, p_max) {
+  data |>
+    filter(crowding_percentile > p_low & crowding_percentile < p_max) |>
+    group_by(AdmittedNonAdmitted) |>
+    summarise(
+      edlos_median = median(EDLOS_hours),
+      edlos_mad = mad(EDLOS_hours)
+    ) |>
+    kabler()
+}
+```
+
+```{r}
+fc_crowd_edlos_p(0.1,0.2)
+```
+
+```{r}
+fc_crowd_edlos_p(0.8,0.9)
+```
+
+# Death
+
+```{r}
+n_pop <- nrow(data_id)
+
+deaths <- data_id |>
+  filter(death_binary == 1L)
+
+n_death <- nrow(deaths)
+
+p_death <- ((n_death/n_pop) *100) |> round(3)
+
+death_age <- median(deaths$AgeonArrival)
+```
+
+* ```r n_death``` of ```r n_pop``` died (```r p_death```%).
+* Median age at first visit: ```r death_age```
+
+```{r}
+admit_death <- data |>
+  filter(
+    next_event_death == 1L &
+      DeathwhilstanIP == "Y"
+  ) |>
+  nrow()
+
+p_admit_death <- ((admit_death/n_death) *100) |> round(3)
+```
+
+Of the deceased patients, ```r p_admit_death```% died during a hospital stay that followed an ED visit.

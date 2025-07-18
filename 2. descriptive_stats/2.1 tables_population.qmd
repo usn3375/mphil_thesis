@@ -1,0 +1,230 @@
+---
+title: "Population Tables"
+author: "USN 3375"
+date: "2025-05-30"
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-location: left
+    toc-title: "Table of Contents"
+    toc-numbering: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{=html}
+<style>
+body {
+text-align: justify}
+</style>
+```
+
+```{r, echo = FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+options(scipen = 999)
+```
+
+```{r}
+library(librarian)
+shelf(
+  kableExtra,
+  table1,
+  stringr,
+  data.table,
+  tidytable,
+  quiet = TRUE
+)
+
+data <- readRDS("./data/processed/data_preprocessed.RDS")
+```
+
+# Prep Data
+
+## ED-Visit-level data
+
+```{r}
+data <- data |>
+  mutate(
+    Gender = case_when(
+      Gender == "M" ~ "Male",
+      Gender == "F" ~ "Female",
+    ),
+    Age = case_when(
+      AgeonArrival < 30 ~ "< 30",
+      AgeonArrival >= 30 & AgeonArrival < 50 ~ "30 - 49",
+      AgeonArrival >= 50 & AgeonArrival < 70 ~ "50 - 69",
+      AgeonArrival >= 70 & AgeonArrival < 90 ~ "70 - 89",
+      AgeonArrival >= 90 ~ "> 90"
+    ),
+    Age = factor(Age, levels = c("< 30", "30 - 49", "50 - 69", "70 - 89", "> 90")),
+    ArrivalMode = case_when(
+      ArrivalMode == "non_ambulance" ~ "Walk-in",
+      ArrivalMode == "ambulance" ~ "By ambulance",
+    ),
+    ArrivalMode = factor(ArrivalMode, levels = c("Walk-in", "By ambulance")),
+    ReferralSource = case_when(
+      ReferralSource == "non_clinical" ~ "Non-physician referral",
+      ReferralSource == "clinical" ~ "Physician referral"
+    ),
+    AdmittingWard = case_when(
+      AdmittingWard == "non_admitted" ~ "Not admitted",
+      AdmittingWard == "admit_ward" ~ "Admitted to wards",
+      AdmittingWard == "admit_icu" ~ "Admitted to ICU"
+    ),
+    AdmittingWard = factor(AdmittingWard, levels = c("Not admitted", "Admitted to wards", "Admitted to ICU")),
+    AcuityScore = factor(AcuityScore, levels = c("1-2", "3-4", "5"))
+  )
+```
+
+## Patient-level data
+
+```{r}
+data_id <- data |>
+  arrange(ArrivalDateTime) |>
+  distinct(id, .keep_all = TRUE) |>
+  mutate(
+    Death = case_when(
+      death_binary == 0 ~ "Did not die",
+      death_binary == 1 ~ "Died",
+    ),
+    total_visits = case_when(
+      attendance_total == 1 ~ "1",
+      attendance_total == 2 ~ "2",
+      attendance_total == 3 ~ "3",
+      attendance_total >  3 ~ "> 3",
+    ),
+    care_home = case_when(
+      CareHomeBinary == 0 ~ "Lives at home",
+      CareHomeBinary == 1 ~ "Lives in care home"
+    )
+  )
+```
+
+## Label Categories
+
+```{r}
+label(data_id$total_visits) <- "Total no. of ED visits during study period"
+label(data_id$Death) <- "Death during study period"
+label(data_id$care_home) <- "Living situation (at time of 1st ED visit)"
+
+label(data$Age) <- "Age (years)"
+label(data$ArrivalMode) <- "Arrival mode"
+label(data$AcuityScore) <- "Acuity score"
+label(data$EDLOS_hours) <- "EDLOS (hours)"
+label(data$FirstNEWS)   <- "NEWS2 score"
+label(data$ReferralSource) <- "Referral source"
+label(data$AdmittingWard)  <- "Hospital admission"
+label(data$LastSpecialty)  <- "Last specialty (admitted patients only)"
+```
+
+# Create Tables
+
+A custom function written to be used inside `table1` to calculate the median and MAD.
+
+```{r}
+fc_tbl_median <- function(x) {
+  med <- median(x, na.rm = TRUE)
+  mad_val <- mad(x, na.rm = TRUE, constant = 1)
+  pval <- ""
+  with(
+    list(med = med, mad_val = mad_val),
+    sprintf("Median: %.1f (MAD: %.1f)", med, mad_val)
+  )
+}
+```
+
+## Table 1: Patient-level
+
+```{r}
+tbl_patients <- table1(
+  ~ Gender +
+    Age +
+    Death +
+    total_visits +
+    care_home,
+  data = data_id,
+  render.continuous = fc_tbl_median
+)
+```
+
+```{r, echo = FALSE}
+kable(tbl_patients)
+```
+
+## Table 2: ED-level
+
+```{r}
+tbl_ed_visits <- table1(
+  ~ Gender +
+    Age +
+    ReferralSource +
+    ArrivalMode +
+    AcuityScore +
+    AdmittingWard +
+    EDLOS_hours +
+    FirstNEWS,
+  data = data,
+  render.continuous = fc_tbl_median
+)
+```
+
+```{r, echo = FALSE}
+kable(tbl_ed_visits)
+```
+
+# Format Tables
+
+Function to create and optimise the LaTeX code of tables.
+
+```{r}
+fc_tex_tbl <- function(t1_object) {
+  raw <- as.character(
+    t1kable(t1_object, format = "latex", booktabs = TRUE)
+  )
+  raw <- gsub("\\\\midrule", "", raw)
+  raw <- gsub("\\\\addlinespace\\[0\\.3em\\]\\s*\n?", "", raw)
+
+  lines <- strsplit(raw, "\n", fixed = TRUE)[[1]]
+  out   <- character()
+  i     <- 1
+
+  while (i <= length(lines)) {
+    if (grepl("^\\\\multicolumn\\{2\\}\\{l\\}\\{\\\\textbf\\{NEWS2 score\\}\\}\\\\", lines[i])) {
+      value <- sub("^\\\\hspace\\{1em\\} &\\s*(.*)$", "\\1", lines[i + 1])
+      out   <- c(out, sprintf("\\textbf{NEWS2 score} & %s", value))
+      i     <- i + 2
+
+    } else if (grepl("^\\\\multicolumn\\{2\\}\\{l\\}\\{\\\\textbf\\{EDLOS \\(hours\\)\\}\\}\\\\", lines[i])) {
+      value <- sub("^\\\\hspace\\{1em\\} &\\s*(.*)$", "\\1", lines[i + 1])
+      out   <- c(out, sprintf("\\textbf{EDLOS (hours)} & %s", value))
+      i     <- i + 2
+
+    } else {
+      out <- c(out, lines[i])
+      i   <- i + 1
+    }
+  }
+  
+  paste(out, collapse = "\n")
+}
+```
+
+```{r}
+tex_tbl_pat <- fc_tex_tbl(tbl_patients)
+tex_tbl_ed  <- fc_tex_tbl(tbl_ed_visits)
+```
+
+# Export Tables
+```{r}
+writeLines(
+  tex_tbl_pat,
+  "./output/tables/descriptive/table1_patients.tex"
+)
+
+writeLines(
+  tex_tbl_ed,
+  "./output/tables/descriptive/table1_ed_visits.tex"
+)
+```
